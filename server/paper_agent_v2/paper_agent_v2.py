@@ -13,12 +13,6 @@ DEFAULT_AGENT_API_BASES = (
     "http://localhost:8998/v1",
     "http://localhost:8999/v1",
 )
-DEFAULT_WARMUP_MODEL_NAME = "qwen3-max"
-DEFAULT_WARMUP_API_KEY = "sk-d85cf3f774b646659b6fd099b9c7672d"
-DEFAULT_WARMUP_AGENT_API_BASES = (
-    "https://dashscope.aliyuncs.com/compatible-mode/v1",
-)
-
 try:
     from .prompts import PAPERSEARCH_SYSTEM_PROMPT, PAPERSEARCH_TOOL_SCHEMAS, PAPERSEARCH_USER_PROMPT, SELECT_PROMPT
     from .utils import Paper, PaperPool, PaperSearchV2Client, call_openai_chat, normalize_arxiv_id
@@ -154,35 +148,6 @@ class PaperSearchV2Agent:
         self._agent_lock = threading.Lock()
         self._agent_tiebreak = 0
         self.api_base = self.agent_backends[0]["url"] if self.agent_backends else api_base
-        self.warmup_enabled = _parse_bool_env("PAPER_AGENT_V2_WARMUP_ENABLED", False)
-        self.warmup_top_k = max(0, _parse_int_env("PAPER_AGENT_V2_WARMUP_TOP_K", 0))
-        self.warmup_model_name = (
-            os.getenv("PAPER_AGENT_V2_WARMUP_MODEL_NAME", DEFAULT_WARMUP_MODEL_NAME).strip()
-            or self.model_name
-        )
-        self.warmup_api_key = (
-            os.getenv("PAPER_AGENT_V2_WARMUP_API_KEY", DEFAULT_WARMUP_API_KEY).strip()
-            or self.api_key
-        )
-        warmup_agent_backends = kwargs.get("warmup_agent_backends")
-        if warmup_agent_backends is not None:
-            self.warmup_agent_backends = _clone_backends(warmup_agent_backends)
-        elif (
-            os.getenv("PAPER_AGENT_V2_WARMUP_AGENT_URLS", "").strip()
-            or os.getenv("PAPER_AGENT_V2_WARMUP_AGENT_NAMES", "").strip()
-            or os.getenv("PAPER_AGENT_V2_WARMUP_API_BASE", "").strip()
-        ):
-            self.warmup_agent_backends = _parse_backends(
-                raw_urls=os.getenv("PAPER_AGENT_V2_WARMUP_AGENT_URLS", "").strip(),
-                raw_names=os.getenv("PAPER_AGENT_V2_WARMUP_AGENT_NAMES", "").strip(),
-                legacy_url=os.getenv("PAPER_AGENT_V2_WARMUP_API_BASE", "").strip(),
-                default_urls=DEFAULT_WARMUP_AGENT_API_BASES,
-                default_prefix="warmup-agent",
-            )
-        else:
-            self.warmup_agent_backends = _clone_backends(self.agent_backends)
-        self._warmup_agent_lock = threading.Lock()
-        self._warmup_agent_tiebreak = 0
 
         scorer_backends = kwargs.get("scorer_backends")
         self.scorer_backends: list[dict[str, Any]] = [
@@ -205,7 +170,6 @@ class PaperSearchV2Agent:
         self.is_paused = False
         self.stop_requested = False
         self.executed_round_count = 0
-        self.warmup_rounds_completed = 0
 
     async def close(self) -> None:
         await self.selector_client.aclose()
@@ -242,9 +206,6 @@ class PaperSearchV2Agent:
         return {
             "current_step": self.current_step,
             "executed_round_count": self.executed_round_count,
-            "warmup_rounds_completed": self.warmup_rounds_completed,
-            "warmup_enabled": self.warmup_enabled,
-            "warmup_top_k": self.warmup_top_k,
             "max_steps": self.max_steps,
             "status": self.status,
             "search_count": sum(1 for action, _ in self.history_actions if action == "search"),
@@ -324,15 +285,6 @@ class PaperSearchV2Agent:
             backend_kind="agent",
         )
 
-    def _reserve_warmup_agent(self, excluded: set[str] | None = None) -> dict[str, Any]:
-        return self._reserve_backend(
-            self.warmup_agent_backends,
-            self._warmup_agent_lock,
-            "_warmup_agent_tiebreak",
-            excluded=excluded,
-            backend_kind="warmup_agent",
-        )
-
     def _reserve_scorer(self, excluded: set[str] | None = None) -> dict[str, Any]:
         return self._reserve_backend(
             self.scorer_backends,
@@ -359,20 +311,7 @@ class PaperSearchV2Agent:
     def _clean_user_prompt(self, user_prompt: str) -> str:
         return re.sub(r"[\u200b\u200c\u200d\uFEFF\u00A0]", " ", user_prompt)
 
-    def _is_warmup_round(self, round_index: int) -> bool:
-        return self.warmup_enabled and round_index <= self.warmup_top_k
-
-    def _get_round_phase(self, round_index: int) -> str:
-        return "warmup" if self._is_warmup_round(round_index) else "base"
-
     def _get_round_model_config(self, round_index: int) -> dict[str, Any]:
-        if self._is_warmup_round(round_index):
-            return {
-                "model_phase": "warmup",
-                "model_name": self.warmup_model_name,
-                "api_key": self.warmup_api_key,
-                "agent_backends": self.warmup_agent_backends,
-            }
         return {
             "model_phase": "base",
             "model_name": self.model_name,
@@ -381,8 +320,6 @@ class PaperSearchV2Agent:
         }
 
     def _reserve_agent_for_phase(self, model_phase: str, excluded: set[str] | None = None) -> dict[str, Any]:
-        if model_phase == "warmup":
-            return self._reserve_warmup_agent(excluded=excluded)
         return self._reserve_agent(excluded=excluded)
 
     def _get_next_turn_message(self, user_query: str, round_index: int = 1):
@@ -503,7 +440,6 @@ class PaperSearchV2Agent:
 
         self.current_step = 0
         self.executed_round_count = 0
-        self.warmup_rounds_completed = 0
         tolerance = 0
         last_paper_count = len(self.paper_pool)
         remaining_search_steps = self.max_search_step
@@ -512,15 +448,11 @@ class PaperSearchV2Agent:
             "run_started",
             round_index=0,
             max_steps=self.max_steps,
-            warmup_enabled=self.warmup_enabled,
-            warmup_top_k=self.warmup_top_k,
             max_parallel_calls=self.max_parallel_calls,
             state=self._round_state_summary(),
         )
 
-        while self.current_step < self.max_steps or (
-            self.warmup_enabled and self.warmup_rounds_completed < self.warmup_top_k
-        ):
+        while self.current_step < self.max_steps:
             if self.stop_requested:
                 break
 
@@ -537,7 +469,7 @@ class PaperSearchV2Agent:
                 self.status = "ITERATING"
 
             round_index = self.executed_round_count + 1
-            model_phase = self._get_round_phase(round_index)
+            model_phase = "base"
             msg, tool_calls = self._get_next_turn_message(user_query, round_index)
             if msg is None and tool_calls is None:
                 self._log_round_event(
@@ -578,10 +510,7 @@ class PaperSearchV2Agent:
                     break_flag = True
 
             self.executed_round_count += 1
-            if model_phase == "warmup":
-                self.warmup_rounds_completed += 1
-            else:
-                self.current_step += 1
+            self.current_step += 1
             self._log_round_event(
                 "round_summary",
                 round_index=round_index,
@@ -644,9 +573,6 @@ class PaperSearchV2Agent:
             "agentState": {
                 "currentStep": self.current_step,
                 "totalSteps": self.max_steps,
-                "warmupEnabled": self.warmup_enabled,
-                "warmupTopK": self.warmup_top_k,
-                "warmupCompleted": self.warmup_rounds_completed,
                 "totalRounds": self.executed_round_count,
                 "searchCount": sum(1 for action, _ in self.history_actions if action == "search"),
                 "expandCount": sum(1 for action, _ in self.history_actions if action == "expand"),

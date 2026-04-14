@@ -24,7 +24,7 @@ from server.session_manager import SessionManager
 
 
 DEFAULT_PAPER_SEARCH_V2_BASE_URL = "http://172.16.100.204:4000"
-DEFAULT_PAPER_SEARCH_V2_API_KEY = "lw-d7ea4e41519dc1cd03b322d0faa8fb9b"
+DEFAULT_PAPER_SEARCH_V2_API_KEY = ""
 
 
 class WebPaperSearchV2Client(LocalPaperSearchClient):
@@ -37,7 +37,8 @@ class WebPaperSearchV2Client(LocalPaperSearchClient):
 
     async def _request(self, method: str, url: str, *, semaphore=None, **kwargs):
         headers = dict(kwargs.pop("headers", {}) or {})
-        headers["X-API-Key"] = self.paper_search_api_key
+        if self.paper_search_api_key:
+            headers["X-API-Key"] = self.paper_search_api_key
         effective_semaphore = self._semaphore if semaphore is None else semaphore
         return await httpx_request_with_retry(
             self.client,
